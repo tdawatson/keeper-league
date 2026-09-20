@@ -715,7 +715,6 @@ SCEN_HEADS = [("Player", 26), ("Pos", 6), ("Age", 6), ("Salary", 13),
               ("ADP", 8), ("Own", 8)]
 SCEN_W = len(SCEN_HEADS) + 1           # +1 spacer column between blocks
 SCEN_COL = PTR_COL + 1                 # T: first scenario block
-HELP_COL = SCEN_COL + N_SCEN * SCEN_W  # hidden: the drop-band bookkeeping
 
 
 def section_rows():
@@ -822,13 +821,13 @@ def build_my_roster(wb, ctx):
 
 def seed_scenarios(ctx):
     """My roster as plain labels, bucketed and ordered the way My Roster
-    shows it, plus the drop-band order.
+    shows it.
 
     These are written into the blocks as text, not formulas, so every one of
     them can be deleted or typed over. That is the whole trick: a scenario row
     is a name and nothing else, and the name is what the stats hang off."""
     mine = [r for r in ctx["roster_rows"] if r["team"] == ctx["my_team"]]
-    labels, cons, fpts = ctx["labels"], ctx["cons"], ctx["fpts"]
+    labels, cons = ctx["labels"], ctx["cons"]
 
     def rank(fn):
         return lambda r: (-(fn(r["id"]) if fn(r["id"]) is not None else -1),
@@ -838,10 +837,7 @@ def seed_scenarios(ctx):
     for _, status, *_ in MY_SECTIONS:
         rows = sorted((r for r in mine if r["status"] == status), key=rank(cons))
         by_status[status] = [labels.get(r["id"]) for r in rows]
-    # the four mandatory drops are banded off last season's points, over
-    # everyone who is not a prospect (rule guide s."Roster Player Drops")
-    drops = sorted((r for r in mine if r["status"] != "MINORS"), key=rank(fpts))
-    return by_status, [labels.get(r["id"]) for r in drops]
+    return by_status
 
 
 def read_scenarios(wb):
@@ -881,7 +877,7 @@ def build_scenarios(ws, ctx):
     over the pool's number, because cap retention (rule guide s."Cap
     Retention") makes the hit a property of the roster spot."""
     plast, rlast = ctx["pool_last"], ctx["roster_last"]
-    seed, drop_order = seed_scenarios(ctx)
+    seed = seed_scenarios(ctx)
     saved = ctx.get("scen_saved") or {}
     # a block that has been typed in is the user's plan, and is restored whole:
     # re-seeding it would quietly undo every player they had deleted
@@ -964,10 +960,10 @@ def build_scenarios(ws, ctx):
         S = {lab: (f, l, s) for lab, _, _, f, l, s, _, _ in sects}
         top, bot = sects[0][3], sects[-1][4]
         span = f"{NM}{top}:{NM}{bot}"
-        names = f"${NM}${top}:${NM}${bot}"      # every slot row in this block
+        slots = f"${NM}${top}:${NM}${bot}"      # every slot row in this block
         # a name typed twice in one block is almost always a paste slip
         ws.conditional_formatting.add(span, FormulaRule(
-            formula=[f'AND({NM}{top}<>"",COUNTIF({names},{NM}{top})>1)'],
+            formula=[f'AND({NM}{top}<>"",COUNTIF({slots},{NM}{top})>1)'],
             font=Font(bold=True, color="C00000")))
         own_span = (f"{gl(c_own)}{sects[0][3]}:{gl(c_own)}{sects[-1][4]}")
         ws.conditional_formatting.add(own_span, CellIsRule(
@@ -1001,9 +997,6 @@ def build_scenarios(ws, ctx):
 
         def cap(n):
             return lambda v: f'=IF({v}<={n},"OK","OVER "&({v}-{n}))'
-
-        def atleast(n):
-            return lambda v: f'=IF({v}>={n},"OK","need "&({n}-{v}))'
 
         band("CAP")
         used = "=" + "+".join(f"{SL}{S[lab][2]}" for lab, *_, in_cap, _ in sects
@@ -1041,28 +1034,6 @@ def build_scenarios(ws, ctx):
         line("Change vs today", f"={SL}{r_p}-$O${ctx['my_pts_row']}", DEC2)
         line(f"FPts {PRIOR}, active", f"={gl(c_fpts)}{S['ROSTER'][2]}", DEC2)
 
-        # the drop bookkeeping: one hidden flag per rostered player, set when
-        # his name is nowhere in this block
-        h_lab, h_flag = gl(HELP_COL), gl(HELP_COL + 1 + k)
-        for i in range(len(drop_order)):
-            r_ = base + i
-            ws.cell(row=r_, column=HELP_COL + 1 + k, value=(
-                f'=IF(${h_lab}{r_}="","",'
-                f'IF(COUNTIF({names},${h_lab}{r_})=0,1,0))'))
-
-        def dropped(n=None):
-            end = base + (n if n is not None else len(drop_order)) - 1
-            return f"=SUM(${h_flag}${base}:${h_flag}${end})"
-
-        rr += 1
-        band("MANDATORY DROPS  -  four required")
-        line("Players dropped", dropped(), bold=True, check=atleast(4))
-        for n, req, lab in ((6, 1, "One from ranks 1-6"),
-                            (12, 2, "Two from ranks 1-12"),
-                            (18, 3, "Three from ranks 1-18")):
-            if n <= len(drop_order):
-                line(f"   {lab}", dropped(n), check=atleast(req))
-
         rr += 1
         for msg in ("Type or pick a name to add a player; clear the cell to drop him.",
                     "Everything else on the row fills itself from Player Pool.",
@@ -1072,13 +1043,6 @@ def build_scenarios(ws, ctx):
                     "pool number."):
             ws.cell(row=rr, column=c_name, value=msg).font = Font(italic=True, size=9)
             rr += 1
-
-    # shared by all three blocks: my roster in drop-band order
-    ws.cell(row=1, column=HELP_COL, value="· drop order").fill = KEY_FILL
-    for i, label in enumerate(drop_order):
-        ws.cell(row=base + i, column=HELP_COL, value=label)
-    for c in range(HELP_COL, HELP_COL + 1 + N_SCEN):
-        ws.column_dimensions[gl(c)].hidden = True
 
 
 def build_team_summary(wb, ctx):
