@@ -13,8 +13,9 @@ workbook navigates by.
 DERIVED sheets - My Roster, Team Summary - are written once, entirely
 out of formulas that look into the source sheets, and are then left alone. A
 data refresh flows through them without disturbing anything typed in by hand
-(the scenario flags and FA-draft rows on My Roster, above all). Pass
---rebuild-derived to regenerate them, which discards that typing.
+(the scenario blocks on My Roster, above all). Pass --rebuild-derived to
+regenerate them; the names typed into the scenario blocks are carried across
+even then.
 
 Usage: ./build_workbook.py [--data data] [--out league.xlsx]
 """
@@ -24,7 +25,7 @@ import json
 import pathlib
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.formatting.rule import CellIsRule
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter as gl
 from openpyxl.workbook.defined_name import DefinedName
@@ -54,11 +55,9 @@ PROJ = "26/27"    # the projections export
 # (12F/6D/2G), 3 bench, 2 IR, 26 prospects. The prospect and drop allowances run
 # past those caps because the offseason permits going over (s."Trades Reopen").
 N_ACTIVE, N_BENCH, N_IR, N_MINORS = 20, 3, 2, 32
-N_DROPS = 30          # drop-eligible rows: active + bench + IR, with headroom
-N_FA = 10             # blank FA-draft slots per scenario
 N_TEAMS = 20
 N_SCEN = 3
-SCENARIOS = False     # what-if blocks on My Roster; off while the drops are settled
+SCENARIOS = True      # side-by-side what-if copies of the roster on My Roster
 
 POOL = "Player Pool"
 DRAFT_SHEET = f"NHL Draft {DRAFT_YEAR}"
@@ -708,8 +707,31 @@ MY_FMT = {8: MONEY, 9: DEC2, 10: DEC2, 11: DEC2, 12: DEC3, 13: DEC2, 14: DEC2,
           15: DEC2, 16: DEC2, 17: DEC2}
 SUM_COLS = (8, 9, 13, 14, 15)          # salary + the three points columns
 PTR_COL = len(MY_COLS) + 1             # S: which Rosters row each slot resolves to
-SCEN_PTR = PTR_COL + 1                 # T: shared by all three scenario blocks
-SCEN_COL = PTR_COL + 2                 # U: first scenario block
+
+# One scenario block: the player name is typed, every other column resolves
+# out of Player Pool by that name. Salary is the exception - see scen_salary.
+SCEN_HEADS = [("Player", 26), ("Pos", 6), ("Age", 6), ("Salary", 13),
+              (f"FPts {PRIOR}", 11), (f"Cons {PROJ}", 12), ("Cons/$M", 10),
+              ("ADP", 8), ("Own", 8)]
+SCEN_W = len(SCEN_HEADS) + 1           # +1 spacer column between blocks
+SCEN_COL = PTR_COL + 1                 # T: first scenario block
+HELP_COL = SCEN_COL + N_SCEN * SCEN_W  # hidden: the drop-band bookkeeping
+
+
+def section_rows():
+    """Where build_my_roster lays each section out.
+
+    (label, status, note, first, last, subtotal, in_cap, scores). The scenario
+    blocks are row-aligned with these, so a slot reads straight across from the
+    live roster to all three what-ifs; read_scenarios uses the same rows to
+    find the typed names again after a rebuild."""
+    row, out = 1, []
+    for label, status, slots, note, in_cap, scores in MY_SECTIONS:
+        row += 2                            # blank line, then the band
+        first = row + 1
+        row += slots + 1                    # the slots, then the subtotal
+        out.append((label, status, note, first, row - 1, row, in_cap, scores))
+    return out
 
 
 def _band(ws, row, c0, width, text):
@@ -729,39 +751,37 @@ def build_my_roster(wb, ctx):
     head_row(ws, MY_HEADS + ["· row"], MY_WIDTHS + [7])
     ws.cell(row=1, column=PTR_COL).fill = KEY_FILL
     ws.column_dimensions[gl(PTR_COL)].hidden = True
-    ws.freeze_panes = "A2"
+    # rows 1-2 stay put: row 1 is the header, row 2 the scenario title strip
+    ws.freeze_panes = "A3"
     fit_headers(ws, MY_HEADS, pad=2)
 
-    row, sect_rows = 1, {}
-    for label, status, slots, note, in_cap, scores in MY_SECTIONS:
-        row += 2
-        _band(ws, row, 1, len(MY_COLS), f"{label}  -  {note}")
-        first = row + 1
-        for k in range(1, slots + 1):
-            row += 1
-            ws.cell(row=row, column=PTR_COL, value=(
+    sects, sect_rows = section_rows(), {}
+    for label, status, note, first, dlast, row, in_cap, scores in sects:
+        _band(ws, first - 1, 1, len(MY_COLS), f"{label}  -  {note}")
+        for k, r_ in enumerate(range(first, dlast + 1), start=1):
+            ws.cell(row=r_, column=PTR_COL, value=(
                 f'=IFERROR(MATCH({TEAM_REF}&"|{status}|"&{k},'
                 f'Rosters!${R["slotkey"]}$2:${R["slotkey"]}${last},0),"")'))
-            ptr = f"${gl(PTR_COL)}{row}"
+            ptr = f"${gl(PTR_COL)}{r_}"
             for i, key in enumerate(MY_COLS, start=1):
-                c = ws.cell(row=row, column=i, value=lookup("Rosters", R[key], last, ptr))
+                c = ws.cell(row=r_, column=i, value=lookup("Rosters", R[key], last, ptr))
                 if i in MY_FMT:
                     c.number_format = MY_FMT[i]
-        row += 1
-        sect_rows[label] = (first, row - 1, row, in_cap, scores)
+        sect_rows[label] = (first, dlast, row, in_cap, scores)
         ws.cell(row=row, column=1, value=(
-            f'="{label} subtotal  ("&COUNTIF(A{first}:A{row - 1},"?*")&")"'))
+            f'="{label} subtotal  ("&COUNTIF(A{first}:A{dlast},"?*")&")"'))
         if in_cap:
-            c = ws.cell(row=row, column=8, value=f"=SUM(H{first}:H{row - 1})")
+            c = ws.cell(row=row, column=8, value=f"=SUM(H{first}:H{dlast})")
             c.number_format = MONEY
         if scores:
             for sc in SUM_COLS[1:]:
                 L = gl(sc)
                 ws.cell(row=row, column=sc,
-                        value=f"=SUM({L}{first}:{L}{row - 1})").number_format = DEC2
+                        value=f"=SUM({L}{first}:{L}{dlast})").number_format = DEC2
         for c_ in ws[row][:len(MY_COLS)]:
             c_.font = Font(bold=True)
             c_.border = TOP_BORDER
+    row = sects[-1][5]
 
     cap_secs = [v for v in sect_rows.values() if v[3]]
     cap_rows = [v[2] for v in cap_secs]
@@ -800,249 +820,265 @@ def build_my_roster(wb, ctx):
         build_scenarios(ws, ctx)
 
 
+def seed_scenarios(ctx):
+    """My roster as plain labels, bucketed and ordered the way My Roster
+    shows it, plus the drop-band order.
+
+    These are written into the blocks as text, not formulas, so every one of
+    them can be deleted or typed over. That is the whole trick: a scenario row
+    is a name and nothing else, and the name is what the stats hang off."""
+    mine = [r for r in ctx["roster_rows"] if r["team"] == ctx["my_team"]]
+    labels, cons, fpts = ctx["labels"], ctx["cons"], ctx["fpts"]
+
+    def rank(fn):
+        return lambda r: (-(fn(r["id"]) if fn(r["id"]) is not None else -1),
+                          labels.get(r["id"]) or "")
+
+    by_status = {}
+    for _, status, *_ in MY_SECTIONS:
+        rows = sorted((r for r in mine if r["status"] == status), key=rank(cons))
+        by_status[status] = [labels.get(r["id"]) for r in rows]
+    # the four mandatory drops are banded off last season's points, over
+    # everyone who is not a prospect (rule guide s."Roster Player Drops")
+    drops = sorted((r for r in mine if r["status"] != "MINORS"), key=rank(fpts))
+    return by_status, [labels.get(r["id"]) for r in drops]
+
+
+def read_scenarios(wb):
+    """The names typed into the scenario blocks, keyed by (block, row).
+
+    My Roster survives a normal refresh untouched, so this only matters under
+    --rebuild-derived - but that is exactly the run where losing a draft plan
+    would hurt. Only the slot rows are read; bands, subtotals and the summary
+    labels share the column and are regenerated."""
+    if "My Roster" not in wb.sheetnames:
+        return {}
+    ws = wb["My Roster"]
+    slots = {r for *_, first, last, _, _, _ in section_rows()
+             for r in range(first, last + 1)}
+    out = {}
+    for k in range(N_SCEN):
+        c = SCEN_COL + k * SCEN_W
+        for r in slots:
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str) and v.strip() and not v.startswith("="):
+                out[(k, r)] = v
+    return out
+
+
 def build_scenarios(ws, ctx):
-    """Side-by-side what-if copies of the roster, for planning the four drops.
+    """Three what-if copies of the roster, side by side with the live one.
 
-    One flag column drives each block: X drops a player, A dresses a bench, IR
-    or prospect player. Every total below is a live formula, so cap space,
-    position counts and band coverage move as the flags are typed. The FA DRAFT
-    rows are deliberately blank - that is where draft targets get penciled in,
-    and they feed the same totals as the players already owned.
+    Each block is row-aligned with the sections on the left, so a slot reads
+    straight across: what you have, then the three plans for it. Exactly one
+    cell per row is typed - the player's name, off a dropdown - and Pos, Age,
+    Salary, points, Cons/$M, ADP and who owns him all resolve out of Player
+    Pool from it. Clear the name and the row empties and every total moves;
+    type a new one into any blank row and it joins them.
 
-    Drop-eligible players are listed in ONE rank-ordered run rather than split
-    by section, because the four bands are read off that rank; the Sect column
-    carries the cap and scoring treatment instead."""
-    last = ctx["roster_last"]
-    HEADS = ["Rk", "Drop?", "Player", "Pos", "Sect", "Salary", f"Consensus {PROJ}"]
-    WIDTHS = [5, 7, 22, 6, 6, 13, 12]
-    W = len(HEADS) + 1
-
-    d_first, d_last = 4, 3 + N_DROPS
-    fa_band = d_last + 1
-    fa_first, fa_last = fa_band + 1, fa_band + N_FA
-    m_band = fa_last + 1
-    m_first, m_last = m_band + 1, m_band + N_MINORS
-    sum_row = m_last + 2
-
-    # the shared pointer column: drop-rank rows, then prospect-slot rows
-    P_ = gl(SCEN_PTR)
-    ws.cell(row=1, column=SCEN_PTR, value="· row").fill = KEY_FILL
-    ws.column_dimensions[P_].width = 7
-    ws.column_dimensions[P_].hidden = True
-    for i in range(N_DROPS):
-        ws.cell(row=d_first + i, column=SCEN_PTR, value=(
-            f'=IFERROR(MATCH({TEAM_REF}&"|"&{i + 1},'
-            f'Rosters!${R["dropkey"]}$2:${R["dropkey"]}${last},0),"")'))
-    for i in range(N_MINORS):
-        ws.cell(row=m_first + i, column=SCEN_PTR, value=(
-            f'=IFERROR(MATCH({TEAM_REF}&"|MINORS|"&{i + 1},'
-            f'Rosters!${R["slotkey"]}$2:${R["slotkey"]}${last},0),"")'))
+    Blocks start seeded with the current roster, so a plan begins as "what I
+    have" and is edited down. Salary prefers this league's cap hit off Rosters
+    over the pool's number, because cap retention (rule guide s."Cap
+    Retention") makes the hit a property of the roster spot."""
+    plast, rlast = ctx["pool_last"], ctx["roster_last"]
+    seed, drop_order = seed_scenarios(ctx)
+    saved = ctx.get("scen_saved") or {}
+    # a block that has been typed in is the user's plan, and is restored whole:
+    # re-seeding it would quietly undo every player they had deleted
+    edited = {k for k, _ in saved}
+    sects = section_rows()
+    base = sects[-1][5] + 2                 # the live sheet's cap block
 
     for k in range(N_SCEN):
-        c0 = SCEN_COL + k * W
-        c_rk, c_flag, c_name, c_pos, c_sect, c_sal, c_pts = range(c0, c0 + 7)
-        SL = gl(c_sal)
+        c0 = SCEN_COL + k * SCEN_W
+        c_name, c_pos, c_age, c_sal, c_fpts, c_cons, c_cpm, c_adp, c_own = \
+            range(c0, c0 + len(SCEN_HEADS))
+        NM, SL = gl(c_name), gl(c_sal)
 
         def rg(c, a, b):
             L = gl(c)
             return f"${L}${a}:${L}${b}"
 
-        def terms(col, agg, crit, extra=None):
-            """agg over the drop run, split by how each section is treated."""
-            out = []
-            for sect, c in crit:
-                pre = f"{rg(col, d_first, d_last)}," if agg == "SUMIFS" else ""
-                pos = f"{extra}," if extra else ""
-                out.append(f'{agg}({pre}{pos}{rg(c_flag, d_first, d_last)},"{c}",'
-                           f'{rg(c_sect, d_first, d_last)},"{sect}")')
-            return out
-
-        def total(col, cap_side):
-            """cap_side: bench/IR count against the cap but do not score."""
-            crit = ([("ROS", "<>X"), ("BEN", "<>X"), ("IR", "A")] if cap_side
-                    else [("ROS", "<>X"), ("BEN", "A"), ("IR", "A")])
-            t = terms(col, "SUMIFS", crit)
-            t.append(f'SUMIFS({rg(col, m_first, m_last)},'
-                     f'{rg(c_flag, m_first, m_last)},"A")')
-            t.append(f"SUM({rg(col, fa_first, fa_last)})")
-            return "=" + "+".join(t)
-
-        def count_pos(p):
-            t = terms(c_pos, "COUNTIFS", [("ROS", "<>X"), ("BEN", "A"), ("IR", "A")],
-                      extra=f'{rg(c_pos, d_first, d_last)},"{p}"')
-            t.append(f'COUNTIFS({rg(c_pos, m_first, m_last)},"{p}",'
-                     f'{rg(c_flag, m_first, m_last)},"A")')
-            t.append(f'COUNTIFS({rg(c_pos, fa_first, fa_last)},"{p}")')
-            return "=" + "+".join(t)
-
-        for c in range(c0, c0 + 7):
+        for i, (h, w) in enumerate(SCEN_HEADS):
+            cell = ws.cell(row=2, column=c0 + i, value=h)
+            cell.fill, cell.font = HEADER_FILL, HEADER_FONT
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            ws.column_dimensions[gl(c0 + i)].width = w
+        ws.column_dimensions[gl(c0 + len(SCEN_HEADS))].width = 2
+        for c in range(c0, c0 + len(SCEN_HEADS)):
             ws.cell(row=1, column=c).fill = SCEN_FILL
-        ws.cell(row=1, column=c0, value=f"SCENARIO {k + 1}").font = Font(
+        ws.cell(row=1, column=c_name, value=f"SCENARIO {k + 1}").font = Font(
             bold=True, color="FFFFFF", size=12)
-        ws.cell(row=1, column=c_name, value="<name this plan>").font = Font(
+        ws.cell(row=1, column=c_sal, value="<name this plan>").font = Font(
             italic=True, color="FFFFFF")
-        for i, h in enumerate(HEADS):
-            c = ws.cell(row=2, column=c0 + i, value=h)
-            c.fill, c.font = HEADER_FILL, HEADER_FONT
-            c.alignment = Alignment(vertical="center", wrap_text=True)
-            ws.column_dimensions[gl(c0 + i)].width = WIDTHS[i]
-        ws.column_dimensions[gl(c0 + 7)].width = 2
-        # these headers live on row 2, which fit_headers never reaches
-        ws.row_dimensions[2].height = 13.5 * max(
-            _wrap_lines(h, WIDTHS[i] - 2) for i, h in enumerate(HEADS)) + 5
 
-        _band(ws, 3, c0, 7, "ROSTER / BENCH / IR  -  ranked by last season points")
-        for i in range(N_DROPS):
-            r_ = d_first + i
-            ptr = f"${P_}{r_}"
-            ws.cell(row=r_, column=c_rk, value=f'=IF({ptr}="","",{i + 1})')
-            f = ws.cell(row=r_, column=c_flag)
-            f.fill, f.alignment = INPUT_FILL, Alignment(horizontal="center")
-            ws.cell(row=r_, column=c_name, value=lookup("Rosters", R["player"], last, ptr))
-            ws.cell(row=r_, column=c_pos, value=lookup("Rosters", R["elig"], last, ptr))
-            st = f'INDEX(Rosters!${R["status"]}$2:${R["status"]}${last},{ptr})'
-            ws.cell(row=r_, column=c_sect, value=(
-                f'=IFERROR(IF({st}="ACTIVE","ROS",IF({st}="RESERVE","BEN","IR")),"")'))
-            ws.cell(row=r_, column=c_sal,
-                    value=lookup("Rosters", R["salary"], last, ptr)).number_format = MONEY
-            ws.cell(row=r_, column=c_pts,
-                    value=lookup("Rosters", R["cons"], last, ptr)).number_format = DEC2
-
-        _band(ws, fa_band, c0, 7,
-              "FA DRAFT ADDS  -  pick from the dropdown; the rest fills itself")
-        # Only the name is typed. Everything else resolves out of Player Pool by
-        # label, so a pick lands with the right cap hit and projection and feeds
-        # the totals below. The lookup is against the whole pool, not just the
-        # FA board, because the FA draft also contains the players every GM is
-        # about to drop (rule guide s."Roster Player Drops") - Sect flags
-        # whether the target is actually free yet.
         dv = DataValidation(type="list", formula1="FAPool", allow_blank=True)
-        dv.showErrorMessage = False          # a name off the board is still fine
-        dv.promptTitle = "FA draft target"
-        dv.prompt = "Pick a free agent, or type any player in the pool."
+        dv.showErrorMessage = False      # a name off the FA board is still fine
+        dv.promptTitle = "Add a player"
+        dv.prompt = ("Pick a free agent, or type any label from Player Pool. "
+                     "Clear the cell to drop the player.")
         ws.add_data_validation(dv)
-        dv.add(f"{gl(c_name)}{fa_first}:{gl(c_name)}{fa_last}")
-        for r_ in range(fa_first, fa_last + 1):
-            ws.cell(row=r_, column=c_name).fill = INPUT_FILL
-            m = (f'MATCH(${gl(c_name)}{r_},'
-                 f"'{POOL}'!${P['label']}$2:${P['label']}${ctx['pool_last']},0)")
-            ws.cell(row=r_, column=c_pos, value=lookup(POOL, P["elig"],
-                                                       ctx["pool_last"], m))
-            own = (f"INDEX('{POOL}'!${P['owner']}$2:${P['owner']}"
-                   f"${ctx['pool_last']},{m})")
-            ws.cell(row=r_, column=c_sect,
-                    value=f'=IFERROR(IF({own}="FA","FA","TAKEN"),"")')
-            ws.cell(row=r_, column=c_sal, value=lookup(POOL, P["salary"],
-                    ctx["pool_last"], m)).number_format = MONEY
-            ws.cell(row=r_, column=c_pts, value=lookup(POOL, P["cons"],
-                    ctx["pool_last"], m)).number_format = DEC2
 
-        _band(ws, m_band, c0, 7,
-              "PROSPECTS  -  A = call up (they are exempt from the four drops)")
-        for i in range(N_MINORS):
-            r_ = m_first + i
-            ptr = f"${P_}{r_}"
-            f = ws.cell(row=r_, column=c_flag)
-            f.fill, f.alignment = INPUT_FILL, Alignment(horizontal="center")
-            ws.cell(row=r_, column=c_name, value=lookup("Rosters", R["player"], last, ptr))
-            ws.cell(row=r_, column=c_pos, value=lookup("Rosters", R["elig"], last, ptr))
-            ws.cell(row=r_, column=c_sect, value=f'=IF({ptr}="","","MIN")')
-            ws.cell(row=r_, column=c_sal,
-                    value=lookup("Rosters", R["salary"], last, ptr)).number_format = MONEY
-            ws.cell(row=r_, column=c_pts,
-                    value=lookup("Rosters", R["cons"], last, ptr)).number_format = DEC2
+        for label, status, note, first, dlast, sub, in_cap, scores in sects:
+            _band(ws, first - 1, c0, len(SCEN_HEADS), f"{label}  -  {note}")
+            dv.add(f"{NM}{first}:{NM}{dlast}")
+            names = seed.get(status, [])
+            for i, r_ in enumerate(range(first, dlast + 1)):
+                nm = f"${NM}{r_}"
+                m = f"MATCH({nm},'{POOL}'!${P['label']}$2:${P['label']}${plast},0)"
+                val = (saved.get((k, r_)) if k in edited
+                       else (names[i] if i < len(names) else None))
+                cell = ws.cell(row=r_, column=c_name, value=val)
+                cell.fill = INPUT_FILL
+                for col, key, fmt in ((c_pos, "elig", None), (c_age, "age", None),
+                                      (c_fpts, "fpts", DEC2), (c_cons, "cons", DEC2),
+                                      (c_cpm, "consperm", DEC2), (c_adp, "adp", DEC2)):
+                    c = ws.cell(row=r_, column=col, value=lookup(POOL, P[key], plast, m))
+                    if fmt:
+                        c.number_format = fmt
+                # the pool salary is the league number; the cap hit on Rosters
+                # is what this team actually pays, and wins where it exists
+                pid = f"INDEX('{POOL}'!${P['id']}$2:${P['id']}${plast},{m})"
+                hit = (f'IFERROR(INDEX(Rosters!${R["salary"]}$2:${R["salary"]}${rlast},'
+                       f'MATCH({pid},Rosters!${R["id"]}$2:${R["id"]}${rlast},0)),"")')
+                pool_sal = f"INDEX('{POOL}'!${P['salary']}$2:${P['salary']}${plast},{m})"
+                ws.cell(row=r_, column=c_sal, value=(
+                    f'=IFERROR(IF({nm}="","",IF(ISNUMBER({hit}),{hit},{pool_sal})),"")'
+                )).number_format = MONEY
+                own = f"INDEX('{POOL}'!${P['owner']}$2:${P['owner']}${plast},{m})"
+                ws.cell(row=r_, column=c_own, value=(
+                    f'=IFERROR(IF({nm}="","",IF({own}="FA","FA",'
+                    f'IF({own}={TEAM_REF},"MINE","TAKEN"))),"")')
+                ).alignment = Alignment(horizontal="center")
 
-        rr = sum_row
+            ws.cell(row=sub, column=c_name, value=(
+                f'="{label}  ("&COUNTIF({NM}{first}:{NM}{dlast},"?*")&")"'))
+            for col, fmt in ((c_sal, MONEY), (c_fpts, DEC2), (c_cons, DEC2)):
+                L = gl(col)
+                ws.cell(row=sub, column=col,
+                        value=f"=SUM({L}{first}:{L}{dlast})").number_format = fmt
+            for c in range(c0, c0 + len(SCEN_HEADS)):
+                ws.cell(row=sub, column=c).font = Font(bold=True)
+                ws.cell(row=sub, column=c).border = TOP_BORDER
+
+        S = {lab: (f, l, s) for lab, _, _, f, l, s, _, _ in sects}
+        top, bot = sects[0][3], sects[-1][4]
+        span = f"{NM}{top}:{NM}{bot}"
+        names = f"${NM}${top}:${NM}${bot}"      # every slot row in this block
+        # a name typed twice in one block is almost always a paste slip
+        ws.conditional_formatting.add(span, FormulaRule(
+            formula=[f'AND({NM}{top}<>"",COUNTIF({names},{NM}{top})>1)'],
+            font=Font(bold=True, color="C00000")))
+        own_span = (f"{gl(c_own)}{sects[0][3]}:{gl(c_own)}{sects[-1][4]}")
+        ws.conditional_formatting.add(own_span, CellIsRule(
+            operator="equal", formula=['"TAKEN"'], font=Font(color="C00000")))
+        ws.conditional_formatting.add(own_span, CellIsRule(
+            operator="equal", formula=['"FA"'], font=Font(bold=True, color="1F7A1F")))
+
+        rr = base
 
         def band(text):
             nonlocal rr
-            _band(ws, rr, c0, 7, text)
+            _band(ws, rr, c0, len(SCEN_HEADS), text)
             rr += 1
 
-        def line(label, value, fmt=None, bold=False):
+        def line(label, value, fmt=None, bold=False, check=None):
             nonlocal rr
-            ws.cell(row=rr, column=c0, value=label).font = Font(bold=bold)
+            ws.cell(row=rr, column=c_name, value=label).font = Font(bold=bold)
             c = ws.cell(row=rr, column=c_sal, value=value)
             c.font = Font(bold=bold)
             if fmt:
                 c.number_format = fmt
+            if check:
+                ws.cell(row=rr, column=c_cons, value=check(f"{SL}{rr}")
+                        ).alignment = Alignment(horizontal="center")
             rr += 1
             return rr - 1
 
-        def status(row, formula):
-            ws.cell(row=row, column=c_pts, value=formula).alignment = Alignment(
-                horizontal="center")
+        def need(n):
+            return lambda v: (f'=IF({v}={n},"OK",IF({v}<{n},"open "&({n}-{v}),'
+                              f'"OVER "&({v}-{n})))')
+
+        def cap(n):
+            return lambda v: f'=IF({v}<={n},"OK","OVER "&({v}-{n}))'
+
+        def atleast(n):
+            return lambda v: f'=IF({v}>={n},"OK","need "&({n}-{v}))'
 
         band("CAP")
-        r_used = line("Salary used  (roster + bench + call-ups + FA)",
-                      total(c_sal, True), MONEY)
+        used = "=" + "+".join(f"{SL}{S[lab][2]}" for lab, *_, in_cap, _ in sects
+                              if in_cap)
+        r_used = line("Salary used  (roster + reserve)", used, MONEY)
         line("Salary cap", f"={CAP_REF}", MONEY)
-        r_space = line("Cap space  (negative = over)", f"={CAP_REF}-{SL}{r_used}",
-                       MONEY, bold=True)
-        ws.conditional_formatting.add(f"{SL}{r_space}", CellIsRule(
-            operator="lessThan", formula=["0"], font=Font(bold=True, color="C00000")))
-        ws.conditional_formatting.add(f"{SL}{r_space}", CellIsRule(
-            operator="greaterThanOrEqual", formula=["0"],
-            font=Font(bold=True, color="1F7A1F")))
-
-        band("ACTIVE ROSTER")
-        pos_rows = []
-        for p, label, need in (("F", "Forwards", 12), ("D", "Defence", 6),
-                               ("G", "Goalies", 2)):
-            r_ = line(f"{label}  (need {need})", count_pos(p))
-            status(r_, f'=IF({SL}{r_}={need},"OK",IF({SL}{r_}<{need},'
-                       f'"open "&({need}-{SL}{r_}),"OVER "&({SL}{r_}-{need})))')
-            pos_rows.append(r_)
-        r_ = line("Active total  (need 20)",
-                  "=" + "+".join(f"{SL}{x}" for x in pos_rows), bold=True)
-        status(r_, f'=IF({SL}{r_}=20,"OK","off by "&ABS(20-{SL}{r_}))')
-        r_ = line("Bench  (max 3)",
-                  f'=COUNTIFS({rg(c_flag, d_first, d_last)},"<>X",'
-                  f'{rg(c_sect, d_first, d_last)},"BEN")'
-                  f'-COUNTIFS({rg(c_flag, d_first, d_last)},"A",'
-                  f'{rg(c_sect, d_first, d_last)},"BEN")')
-        status(r_, f'=IF({SL}{r_}<=3,"OK","OVER "&({SL}{r_}-3))')
-        r_ = line("Prospects  (max 26)",
-                  f'=COUNTIFS({rg(c_sal, m_first, m_last)},">0")'
-                  f'-COUNTIFS({rg(c_flag, m_first, m_last)},"A")'
-                  f'-COUNTIFS({rg(c_flag, m_first, m_last)},"X")')
-        status(r_, f'=IF({SL}{r_}<=26,"OK","OVER "&({SL}{r_}-26))')
-
-        band("MANDATORY DROPS  -  four required")
-        drops = (f'=COUNTIFS({rg(c_flag, d_first, d_last)},"X",'
-                 f'{rg(c_sal, d_first, d_last)},">0")')
-        r_made = line("Drops flagged", drops, bold=True)
-        status(r_made, f'=IF({SL}{r_made}>=4,"OK","need "&(4-{SL}{r_made}))')
-        for thresh, need, label in ((6, 1, "One from ranks 1-6"),
-                                    (12, 2, "Two from ranks 1-12"),
-                                    (18, 3, "Three from ranks 1-18")):
-            r_ = line(f"   {label}",
-                      f'=COUNTIFS({rg(c_rk, d_first, d_last)},"<={thresh}",'
-                      f'{rg(c_flag, d_first, d_last)},"X",'
-                      f'{rg(c_sal, d_first, d_last)},">0")')
-            status(r_, f'=IF({SL}{r_}>={need},"OK","need "&({need}-{SL}{r_}))')
-
-        band("POINTS")
-        r_p = line("Projected active points  (consensus)", total(c_pts, False),
-                   DEC2, bold=True)
-        line("Change vs today", f"={SL}{r_p}-$O${ctx['my_pts_row']}", DEC2)
+        r_sp = line("Cap space  (negative = over)", f"={CAP_REF}-{SL}{r_used}",
+                    MONEY, bold=True)
+        for op, colour in (("lessThan", "C00000"), ("greaterThanOrEqual", "1F7A1F")):
+            ws.conditional_formatting.add(f"{SL}{r_sp}", CellIsRule(
+                operator=op, formula=["0"], font=Font(bold=True, color=colour)))
 
         rr += 1
-        for msg in ('Type X in "Drop?" to drop a player; A to dress a bench, IR or '
-                    'prospect player.',
-                    'Prospects are exempt from the four drops, but calling one up '
-                    'puts him on the cap.',
-                    "Rk is last season's points rank among non-prospects - the four "
-                    'bands come off that order.'):
-            ws.cell(row=rr, column=c0, value=msg).font = Font(italic=True, size=9)
+        band("ACTIVE ROSTER")
+        a_first, a_last, _ = S["ROSTER"]
+        # dual eligibility ("D,F") counts toward both, which is what it buys
+        for p, lab, n in (("F", "Forwards", 12), ("D", "Defence", 6),
+                          ("G", "Goalies", 2)):
+            line(f"{lab}  (need {n})",
+                 f'=COUNTIF({rg(c_pos, a_first, a_last)},"*{p}*")', check=need(n))
+        line("Active total  (need 20)",
+             f'=COUNTIF({rg(c_name, a_first, a_last)},"?*")', bold=True,
+             check=need(N_ACTIVE))
+        for lab, key, n, chk in (("Reserve", "RESERVE", N_BENCH, cap(N_BENCH)),
+                                 ("IR", "IR", N_IR, cap(N_IR)),
+                                 ("Prospects", "MINORS", 26, cap(26))):
+            f_, l_, _ = S[key]
+            line(f"{lab}  (max {n})",
+                 f'=COUNTIF({rg(c_name, f_, l_)},"?*")', check=chk)
+
+        rr += 1
+        band("POINTS")
+        r_p = line(f"Projected points, active  (consensus {PROJ})",
+                   f"={gl(c_cons)}{S['ROSTER'][2]}", DEC2, bold=True)
+        line("Change vs today", f"={SL}{r_p}-$O${ctx['my_pts_row']}", DEC2)
+        line(f"FPts {PRIOR}, active", f"={gl(c_fpts)}{S['ROSTER'][2]}", DEC2)
+
+        # the drop bookkeeping: one hidden flag per rostered player, set when
+        # his name is nowhere in this block
+        h_lab, h_flag = gl(HELP_COL), gl(HELP_COL + 1 + k)
+        for i in range(len(drop_order)):
+            r_ = base + i
+            ws.cell(row=r_, column=HELP_COL + 1 + k, value=(
+                f'=IF(${h_lab}{r_}="","",'
+                f'IF(COUNTIF({names},${h_lab}{r_})=0,1,0))'))
+
+        def dropped(n=None):
+            end = base + (n if n is not None else len(drop_order)) - 1
+            return f"=SUM(${h_flag}${base}:${h_flag}${end})"
+
+        rr += 1
+        band("MANDATORY DROPS  -  four required")
+        line("Players dropped", dropped(), bold=True, check=atleast(4))
+        for n, req, lab in ((6, 1, "One from ranks 1-6"),
+                            (12, 2, "Two from ranks 1-12"),
+                            (18, 3, "Three from ranks 1-18")):
+            if n <= len(drop_order):
+                line(f"   {lab}", dropped(n), check=atleast(req))
+
+        rr += 1
+        for msg in ("Type or pick a name to add a player; clear the cell to drop him.",
+                    "Everything else on the row fills itself from Player Pool.",
+                    "Own: FA = unowned, TAKEN = on another roster, MINE = yours.",
+                    "Move a player between sections by cutting the name to another row.",
+                    "Salary uses this league's cap hit where there is one, else the "
+                    "pool number."):
+            ws.cell(row=rr, column=c_name, value=msg).font = Font(italic=True, size=9)
             rr += 1
-        for msg in ('FA DRAFT ADDS: pick a name and pos / salary / points fill '
-                    'themselves from Player Pool.',
-                    'Sect reads FA if the target is unowned today, TAKEN if he is '
-                    'still on a roster (he may yet be dropped).',
-                    'The FA Pool sheet is the same list as a sortable board.'):
-            ws.cell(row=rr, column=c0, value=msg).font = Font(italic=True, size=9)
-            rr += 1
+
+    # shared by all three blocks: my roster in drop-band order
+    ws.cell(row=1, column=HELP_COL, value="· drop order").fill = KEY_FILL
+    for i, label in enumerate(drop_order):
+        ws.cell(row=base + i, column=HELP_COL, value=label)
+    for c in range(HELP_COL, HELP_COL + 1 + N_SCEN):
+        ws.column_dimensions[gl(c)].hidden = True
 
 
 def build_team_summary(wb, ctx):
@@ -1263,6 +1299,7 @@ def main():
 
     ctx["draft_ticks"] = read_ticks(wb, DRAFT_SHEET)
     ctx["board_ticks"] = read_ticks(wb, BOARD_SHEET)
+    ctx["scen_saved"] = read_scenarios(wb)
     for name in list(wb.sheetnames):
         if name in SOURCE_SHEETS or (args.rebuild_derived and name in DERIVED_SHEETS):
             del wb[name]
